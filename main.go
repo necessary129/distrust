@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
@@ -8,11 +9,15 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httprate"
 	"github.com/ory/fosite"
 	"github.com/parkour-vienna/distrust/auth"
 	"github.com/parkour-vienna/distrust/discourse"
@@ -24,7 +29,12 @@ import (
 )
 
 type clientConfig struct {
-	Secret       string
+	// Secret is a plaintext secret that will be bcrypted at startup. Mutually
+	// exclusive with SecretHash.
+	Secret string
+	// SecretHash is a pre-bcrypted secret. Use this when the operator does not
+	// want plaintext secrets in the config file. Mutually exclusive with Secret.
+	SecretHash   string
 	RedirectURIs []string
 	AllowGroups  []string
 	DenyGroups   []string
@@ -65,31 +75,56 @@ func main() {
 	}
 
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(securityHeaders)
 	r.Use(requestlog.Zerologger)
 	r.Get("/", func(rw http.ResponseWriter, r *http.Request) {
 		http.Redirect(rw, r, dsettings.Server, http.StatusTemporaryRedirect)
 	})
 
 	// oauth2 setup
-	clients := map[string]clientConfig{}
-	err = viper.UnmarshalKey("clients", &clients)
+	issuer := viper.GetString("oidc.issuer")
+	if issuer == "" {
+		log.Fatal().Msg("oidc.issuer is required (set it to the public base URL of the /oauth2 path of this server)")
+	}
+
+	rawKey := viper.GetString("oidc.privatekey")
+	if rawKey == "" {
+		log.Fatal().Msg("oidc.privatekey is required; generate one with `distrust genkey`")
+	}
+	priv, err := parsePrivateKey(rawKey)
 	if err != nil {
+		log.Fatal().Err(err).Msg("failed to load oidc.privatekey")
+	}
+
+	secret := viper.GetString("oidc.secret")
+	if len(secret) != 32 {
+		log.Fatal().Int("len", len(secret)).Msg("oidc.secret must be exactly 32 bytes long")
+	}
+
+	clients := map[string]clientConfig{}
+	if err := viper.UnmarshalKey("clients", &clients); err != nil {
 		log.Fatal().Err(err).Msg("failed to parse clients")
 	}
-	log.Info().Int("numClients", len(clients)).Msg("clients loaded")
-	options := []auth.OIDCOption{}
-	if viper.GetString("oidc.privatekey") != "" {
-		priv, err := parsePrivateKey(viper.GetString("oidc.privatekey"))
-		if err != nil {
-			log.Warn().Err(err).Msg("failed to load private key")
-		} else {
-			options = append(options, auth.WithPrivateKey(priv))
-		}
+	fclients, err := toFositeClients(clients)
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid client configuration")
 	}
-	if viper.GetString("oidc.secret") != "" {
-		options = append(options, auth.WithSecret([]byte(viper.GetString("oidc.secret"))))
+	log.Info().Int("numClients", len(fclients)).Msg("clients loaded")
+
+	oidc, err := auth.NewOIDC("/oauth2", dsettings, fclients,
+		auth.WithIssuer(issuer),
+		auth.WithPrivateKey(priv),
+		auth.WithSecret([]byte(secret)),
+		// Per-IP rate limiter on the user-initiated discourse handshake.
+		// 30 attempts per minute is generous enough not to bother real users
+		// (each /auth → /callback round-trip uses two requests) but cuts off
+		// brute-force enumeration of nonces or session IDs.
+		auth.WithAuthRateLimiter(httprate.LimitByIP(30, time.Minute)),
+	)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to construct OIDC provider")
 	}
-	oidc := auth.NewOIDC("/oauth2", dsettings, toFositeClients(clients), options...)
 	r.Route("/oauth2", oidc.RegisterHandlers)
 
 	srv := &http.Server{
@@ -102,19 +137,73 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	log.Info().Str("url", "http://"+viper.GetString("listenAddr")).Msg("Starting server")
-	log.Fatal().Err(srv.ListenAndServe())
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Info().Str("url", "http://"+viper.GetString("listenAddr")).Msg("Starting server")
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal().Err(err).Msg("http server failed")
+		}
+	}()
+
+	<-ctx.Done()
+	log.Info().Msg("shutdown signal received, draining connections")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Warn().Err(err).Msg("http server shutdown reported an error")
+	}
+	if err := oidc.Shutdown(shutdownCtx); err != nil {
+		log.Warn().Err(err).Msg("oidc provider shutdown reported an error")
+	}
+	log.Info().Msg("shutdown complete")
 }
 
-func toFositeClients(clients map[string]clientConfig) map[string]fosite.Client {
+// securityHeaders sets baseline response headers that are sound defaults for an
+// API/OIDC server: tell browsers not to MIME-sniff, never frame the responses,
+// and (when running on https) require HTTPS for a year. CSP is intentionally
+// strict — distrust serves no HTML in normal flows.
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		h := rw.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+		if req.TLS != nil {
+			h.Set("Strict-Transport-Security", "max-age=31536000")
+		}
+		next.ServeHTTP(rw, req)
+	})
+}
+
+func toFositeClients(clients map[string]clientConfig) (map[string]fosite.Client, error) {
 	r := make(map[string]fosite.Client)
 	for k, v := range clients {
+		if len(v.RedirectURIs) == 0 {
+			return nil, fmt.Errorf("client %q: redirectURIs must not be empty", k)
+		}
 
-		hs := []byte(v.Secret)
+		hasSecret := v.Secret != ""
+		hasHash := v.SecretHash != ""
+		if hasSecret == hasHash {
+			return nil, fmt.Errorf("client %q: exactly one of `secret` or `secretHash` must be set", k)
+		}
 
-		_, err := bcrypt.Cost(hs)
-		if err != nil {
-			hs, _ = bcrypt.GenerateFromPassword(hs, 12)
+		var hs []byte
+		if hasHash {
+			hs = []byte(v.SecretHash)
+			if _, err := bcrypt.Cost(hs); err != nil {
+				return nil, fmt.Errorf("client %q: secretHash is not a valid bcrypt hash: %w", k, err)
+			}
+		} else {
+			h, err := bcrypt.GenerateFromPassword([]byte(v.Secret), 12)
+			if err != nil {
+				return nil, fmt.Errorf("client %q: failed to bcrypt secret: %w", k, err)
+			}
+			hs = h
 		}
 
 		r[k] = &auth.DistrustClient{
@@ -133,7 +222,7 @@ func toFositeClients(clients map[string]clientConfig) map[string]fosite.Client {
 			log.Warn().Str("client", k).Msg("allow and deny group options are set. allow groups will be used")
 		}
 	}
-	return r
+	return r, nil
 }
 
 func parsePrivateKey(raw string) (*rsa.PrivateKey, error) {

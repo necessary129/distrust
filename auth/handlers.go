@@ -1,22 +1,19 @@
 package auth
 
 import (
-	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"math/big"
 	"net/http"
+	"net/mail"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
-	jose "github.com/go-jose/go-jose/v3"
 	"github.com/google/uuid"
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/handler/openid"
-	"github.com/parkour-vienna/distrust/cryptutils"
 	"github.com/parkour-vienna/distrust/discourse"
 	"github.com/rs/zerolog/log"
 )
@@ -34,16 +31,13 @@ func (o *OIDCProvider) authEndpoint(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	aroot := o.getAuthRoot(req)
-	callback := aroot + "/callback"
-	nonceMax := big.NewInt(math.MaxInt32)
-	nonceVal, err := cryptorand.Int(cryptorand.Reader, nonceMax)
+	callback := o.issuer + "/callback"
+	nonce, err := discourse.NewNonce()
 	if err != nil {
 		log.Error().Err(err).Msg("generating nonce")
 		http.Error(rw, "failed to initialize login", http.StatusInternalServerError)
 		return
 	}
-	nonce := int(nonceVal.Int64())
 	url := discourse.GenerateURL(o.discourseServer, callback, o.discourseSecret, nonce)
 
 	sessionId := uuid.New()
@@ -55,7 +49,6 @@ func (o *OIDCProvider) authEndpoint(rw http.ResponseWriter, req *http.Request) {
 		ExpiresAt: expiration,
 		Ar:        ar,
 	})
-	isSecure := requestScheme(req) == "https"
 	http.SetCookie(rw, &http.Cookie{
 		Name:     "oidc_session",
 		Value:    sessionId.String(),
@@ -63,7 +56,7 @@ func (o *OIDCProvider) authEndpoint(rw http.ResponseWriter, req *http.Request) {
 		Expires:  expiration,
 		MaxAge:   int((10 * time.Minute).Seconds()),
 		HttpOnly: true,
-		Secure:   isSecure,
+		Secure:   o.cookieSecure,
 		SameSite: http.SameSiteLaxMode,
 	})
 	http.Redirect(rw, req, url, http.StatusTemporaryRedirect)
@@ -77,22 +70,22 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 	cookie, err := req.Cookie("oidc_session")
 	if err != nil {
 		log.Warn().Err(err).Msg("fetching cookie")
-		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+		writeInvalidSession(rw, http.StatusBadRequest)
 		return
 	}
 	sessionID, err := uuid.Parse(cookie.Value)
 	if err != nil {
-		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+		writeInvalidSession(rw, http.StatusBadRequest)
 		return
 	}
 
 	session, ok := o.popInFlight(sessionID)
 	if !ok {
-		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+		writeInvalidSession(rw, http.StatusUnauthorized)
 		return
 	}
 	if time.Now().After(session.ExpiresAt) {
-		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+		writeInvalidSession(rw, http.StatusUnauthorized)
 		return
 	}
 
@@ -102,10 +95,15 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 		return
 	}
 
+	if err := validateDiscoursePayload(values); err != nil {
+		log.Warn().Err(err).Msg("rejecting discourse payload")
+		o.oauth2.WriteAuthorizeError(ctx, rw, session.Ar, err)
+		return
+	}
+
 	log.Debug().
 		Str("username", values.Get("username")).
 		Str("groups", values.Get("groups")).
-		Str("nonce", values.Get("nonce")).
 		Msg("parsed user data")
 
 	switch client := session.Ar.GetClient().(type) {
@@ -114,7 +112,7 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 		err := validateGroups(client, values)
 		if err != nil {
 			log.Warn().Err(err).Msg("group validation failed")
-			fmt.Fprintf(rw, "You are not allowed to access this application: %s", err.Error())
+			http.Error(rw, "Access denied", http.StatusForbidden)
 			return
 		}
 	}
@@ -126,8 +124,11 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 	// NewAuthorizeResponse is capable of running multiple response type handlers which in turn enables this library
 	// to support open id connect.
 
-	aroot := o.getAuthRoot(req)
-	mySessionData := o.newSession(aroot, values)
+	mySessionData := o.newSession(o.issuer, values)
+	// H1: bind the audience to this client at the authorize step. The session
+	// is persisted and re-loaded on /token, /introspect and /userinfo, so
+	// setting it here is sufficient for all downstream code paths.
+	mySessionData.Claims.Audience = []string{session.Ar.GetClient().GetID()}
 	response, err := o.oauth2.NewAuthorizeResponse(req.Context(), session.Ar, mySessionData)
 
 	// Catch any errors, e.g.:
@@ -148,11 +149,10 @@ func (o *OIDCProvider) introspectionEndpoint(rw http.ResponseWriter, req *http.R
 	// This context will be passed to all methods.
 	ctx := req.Context()
 
-	aroot := o.getAuthRoot(req)
-	mySessionData := o.newSession(aroot, nil)
+	mySessionData := o.newSession(o.issuer, nil)
 	ir, err := o.oauth2.NewIntrospectionRequest(ctx, req, mySessionData)
 	if err != nil {
-		log.Warn().Err(err)
+		log.Warn().Err(err).Msg("introspection request failed")
 		o.oauth2.WriteIntrospectionError(ctx, rw, err)
 		return
 	}
@@ -176,8 +176,7 @@ func (o *OIDCProvider) tokenEndpoint(rw http.ResponseWriter, req *http.Request) 
 	ctx := req.Context()
 
 	// Create an empty session object which will be passed to the request handlers
-	aroot := o.getAuthRoot(req)
-	mySessionData := o.newSession(aroot, nil)
+	mySessionData := o.newSession(o.issuer, nil)
 
 	// This will create an access request object and iterate through the registered TokenEndpointHandlers to validate the request.
 	accessRequest, err := o.oauth2.NewAccessRequest(ctx, req, mySessionData)
@@ -219,61 +218,30 @@ func (o *OIDCProvider) tokenEndpoint(rw http.ResponseWriter, req *http.Request) 
 }
 
 func (o *OIDCProvider) informationEndpoint(rw http.ResponseWriter, req *http.Request) {
-	rw.Header().Add("Content-Type", "application/json")
-
-	aroot := o.getAuthRoot(req)
-
-	_ = json.NewEncoder(rw).Encode(map[string]interface{}{
-		"issuer":                 aroot,
-		"authorization_endpoint": aroot + "/auth",
-		"token_endpoint":         aroot + "/token",
-		"userinfo_endpoint":      aroot + "/userinfo",
-		"jwks_uri":               aroot + "/certs",
-		"response_types_supported": []string{
-			"code",
-			"none",
-			"token",
-			"id_token",
-			"code token",
-			"code id_token",
-			"code id_token token",
-		},
-		"subject_types_supported":               []string{"public", "pairwise"},
-		"id_token_signing_alg_values_supported": []string{"RS256"},
-	})
+	rw.Header().Set("Content-Type", "application/json")
+	_, _ = rw.Write(o.discoveryJSON)
 }
 
 func (o *OIDCProvider) certsEndpoint(rw http.ResponseWriter, req *http.Request) {
-	jwks := &jose.JSONWebKeySet{
-		Keys: []jose.JSONWebKey{
-			{
-				Algorithm: "RS256",
-				KeyID:     cryptutils.KeyID(o.privateKey.PublicKey),
-				Use:       "sig",
-				Key:       &o.privateKey.PublicKey,
-			},
-		},
-	}
-	rw.Header().Add("Content-Type", "application/json")
-	_ = json.NewEncoder(rw).Encode(jwks)
+	rw.Header().Set("Content-Type", "application/json")
+	_, _ = rw.Write(o.jwksJSON)
 }
 
 func (o *OIDCProvider) userInfoEndpoint(rw http.ResponseWriter, req *http.Request) {
-	aroot := o.getAuthRoot(req)
-	session := o.newSession(aroot, nil)
+	session := o.newSession(o.issuer, nil)
 	tokenType, ar, err := o.oauth2.IntrospectToken(req.Context(), fosite.AccessTokenFromRequest(req), fosite.AccessToken, session)
 	if err != nil {
 		rfcerr := fosite.ErrorToRFC6749Error(err)
 		if rfcerr.StatusCode() == http.StatusUnauthorized {
-			rw.Header().Set("WWW-Authenticate", fmt.Sprintf("error=%s,error_description=%s", rfcerr.ErrorField, rfcerr.GetDescription()))
+			setBearerErrorHeader(rw, rfcerr.ErrorField)
 		}
+		log.Warn().Err(err).Msg("userinfo introspect failed")
 		http.Error(rw, "invalid access token", http.StatusUnauthorized)
 		return
 	}
 
 	if tokenType != fosite.AccessToken {
-		err := errors.New("Only Access tokens can be used to fetch user information")
-		rw.Header().Set("WWW-Authenticate", fmt.Sprintf("error_description=%s", err.Error()))
+		setBearerErrorHeader(rw, "invalid_token")
 		http.Error(rw, "invalid access token", http.StatusUnauthorized)
 		return
 	}
@@ -285,31 +253,66 @@ func (o *OIDCProvider) userInfoEndpoint(rw http.ResponseWriter, req *http.Reques
 	_ = json.NewEncoder(rw).Encode(info)
 }
 
-func (o *OIDCProvider) getAuthRoot(req *http.Request) string {
-	scheme := requestScheme(req)
-	aroot := scheme + "://" + req.Host + o.root
-	return aroot
+// maxClaimFieldBytes bounds the per-field length of values copied from a
+// Discourse SSO payload into ID-token claims. The HMAC verifies integrity but
+// not shape; this caps the blast radius of a hostile or buggy upstream.
+const maxClaimFieldBytes = 256
+
+// validateDiscoursePayload enforces basic shape constraints on the post-HMAC
+// SSO payload before its fields are copied into ID-token claims (M8).
+func validateDiscoursePayload(v url.Values) error {
+	required := []string{"external_id", "username"}
+	for _, k := range required {
+		if v.Get(k) == "" {
+			return fmt.Errorf("discourse payload missing required field %q", k)
+		}
+	}
+	if _, err := strconv.ParseInt(v.Get("external_id"), 10, 64); err != nil {
+		return fmt.Errorf("discourse external_id is not numeric: %w", err)
+	}
+	bounded := []string{"external_id", "username", "name", "email", "avatar_url", "groups"}
+	for _, k := range bounded {
+		if len(v.Get(k)) > maxClaimFieldBytes {
+			return fmt.Errorf("discourse payload field %q exceeds %d bytes", k, maxClaimFieldBytes)
+		}
+	}
+	if email := v.Get("email"); email != "" {
+		if _, err := mail.ParseAddress(email); err != nil {
+			return fmt.Errorf("discourse payload email is malformed: %w", err)
+		}
+	}
+	return nil
 }
 
-func requestScheme(req *http.Request) string {
-	if req.TLS != nil {
-		return "https"
+// writeInvalidSession writes a JSON error body for the OIDC callback session
+// failures and sets a real HTTP status (vs. the implicit 200 OK that an
+// unconditional Encoder.Encode produces).
+func writeInvalidSession(rw http.ResponseWriter, status int) {
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(status)
+	_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+}
+
+// setBearerErrorHeader writes an RFC 6750 §3-compliant WWW-Authenticate header.
+// errField is restricted to the OAuth2 error-code charset so we can safely
+// inline it without quoting risk.
+func setBearerErrorHeader(rw http.ResponseWriter, errField string) {
+	safe := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '-':
+			return r
+		}
+		return -1
+	}, errField)
+	if safe == "" {
+		safe = "invalid_token"
 	}
-	parts := strings.Split(req.Header.Get("X-Forwarded-Proto"), ",")
-	if len(parts) == 0 {
-		return "http"
-	}
-	scheme := strings.ToLower(strings.TrimSpace(parts[0]))
-	if scheme == "http" || scheme == "https" {
-		return scheme
-	}
-	return "http"
+	rw.Header().Set("WWW-Authenticate", `Bearer realm="oauth2", error="`+safe+`"`)
 }
 
 func validateGroups(client *DistrustClient, values url.Values) error {
-	userGroups := values.Get("groups")
 	groupMap := make(map[string]bool)
-	for _, g := range strings.Split(userGroups, ",") {
+	for _, g := range splitGroups(values.Get("groups")) {
 		groupMap[g] = true
 	}
 	for _, allowed := range client.AllowGroups {

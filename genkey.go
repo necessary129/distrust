@@ -15,8 +15,10 @@ func genkey() {
 		log.Fatal(err)
 	}
 	out := x509.MarshalPKCS1PrivateKey(priv)
-	log.Fatal(pem.Encode(os.Stdout, &pem.Block{
+	if err := pem.Encode(os.Stdout, &pem.Block{
 		Type:  "RSA PRIVATE KEY",
 		Bytes: out,
-	}))
+	}); err != nil {
+		log.Fatal(err)
+	}
 }

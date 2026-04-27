@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -42,13 +41,17 @@ func newIntegrationProviderAndRouter(t *testing.T) (*OIDCProvider, http.Handler)
 		},
 	}
 
-	provider := NewOIDC(
+	provider, err := NewOIDC(
 		"/oauth2",
 		discourse.SSOConfig{Server: "https://forum.example", Secret: "disc-secret"},
 		clients,
+		WithIssuer("https://distrust.example/oauth2"),
 		WithPrivateKey(priv),
 		WithSecret([]byte("0123456789abcdef0123456789abcdef")),
 	)
+	if err != nil {
+		t.Fatalf("failed to construct provider: %v", err)
+	}
 
 	r := chi.NewRouter()
 	r.Route("/oauth2", provider.RegisterHandlers)
@@ -151,8 +154,8 @@ func TestCallbackEndpointSuccessAndReplayRejection(t *testing.T) {
 		t.Fatal("expected session to be present in in-flight store")
 	}
 
-	payload := "nonce=" + url.QueryEscape(intToString(inflightReq.Nonce)) +
-		"&external_id=user-1&username=alice&email=alice%40example.org&name=Alice&groups=team"
+	payload := "nonce=" + url.QueryEscape(inflightReq.Nonce) +
+		"&external_id=1&username=alice&email=alice%40example.org&name=Alice&groups=team"
 	sso, sig := signDiscourseSSO(t, "disc-secret", payload)
 	q := url.Values{}
 	q.Set("sso", sso)
@@ -180,8 +183,8 @@ func TestCallbackEndpointSuccessAndReplayRejection(t *testing.T) {
 	replayRes := httptest.NewRecorder()
 	router.ServeHTTP(replayRes, replayReq)
 
-	if replayRes.Code != http.StatusOK {
-		t.Fatalf("expected replay response status 200 with JSON error, got %d", replayRes.Code)
+	if replayRes.Code != http.StatusUnauthorized {
+		t.Fatalf("expected replay response status 401, got %d", replayRes.Code)
 	}
 	if !strings.Contains(replayRes.Body.String(), "invalid session") {
 		t.Fatalf("expected invalid session response, got %q", replayRes.Body.String())
@@ -192,7 +195,7 @@ func TestCallbackEndpointRejectsExpiredSession(t *testing.T) {
 	provider, router := newIntegrationProviderAndRouter(t)
 
 	sessionID := uuid.New()
-	provider.storeInFlight(sessionID, &InFlightRequest{Nonce: 1, ExpiresAt: time.Now().Add(-time.Second)})
+	provider.storeInFlight(sessionID, &InFlightRequest{Nonce: "x", ExpiresAt: time.Now().Add(-time.Second)})
 
 	req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?sso=a&sig=b", nil)
 	req.AddCookie(&http.Cookie{Name: "oidc_session", Value: sessionID.String()})
@@ -200,14 +203,11 @@ func TestCallbackEndpointRejectsExpiredSession(t *testing.T) {
 
 	router.ServeHTTP(res, req)
 
-	if res.Code != http.StatusOK {
-		t.Fatalf("status mismatch: got %d want %d", res.Code, http.StatusOK)
+	if res.Code != http.StatusUnauthorized {
+		t.Fatalf("status mismatch: got %d want %d", res.Code, http.StatusUnauthorized)
 	}
 	if !strings.Contains(res.Body.String(), "invalid session") {
 		t.Fatalf("expected invalid session response, got %q", res.Body.String())
 	}
 }
 
-func intToString(v int) string {
-	return strconv.Itoa(v)
-}
