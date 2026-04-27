@@ -1,9 +1,9 @@
 package discourse
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -41,7 +41,7 @@ func ValidateResponse(sso, sig, key string, nonce int) (url.Values, error) {
 		return nil, fmt.Errorf("decoding signature: %w", err)
 	}
 
-	if !bytes.Equal(h.Sum(nil), rsig) {
+	if subtle.ConstantTimeCompare(h.Sum(nil), rsig) != 1 {
 		return nil, errors.New("wrong signature from discourse")
 	}
 
@@ -59,7 +59,7 @@ func ValidateResponse(sso, sig, key string, nonce int) (url.Values, error) {
 		return nil, fmt.Errorf("parsing returned nonce: %w", err)
 	}
 
-	if rnonce != nonce {
+	if subtle.ConstantTimeEq(int32(rnonce), int32(nonce)) != 1 {
 		return nil, errors.New("wrong nonce from discourse")
 	}
 

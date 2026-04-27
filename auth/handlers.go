@@ -1,23 +1,24 @@
 package auth
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
+	"math"
+	"math/big"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
+	jose "github.com/go-jose/go-jose/v3"
 	"github.com/google/uuid"
 	"github.com/ory/fosite"
 	"github.com/ory/fosite/handler/openid"
 	"github.com/parkour-vienna/distrust/cryptutils"
 	"github.com/parkour-vienna/distrust/discourse"
 	"github.com/rs/zerolog/log"
-	jose "github.com/go-jose/go-jose/v3"
 )
 
 func (o *OIDCProvider) authEndpoint(rw http.ResponseWriter, req *http.Request) {
@@ -35,27 +36,36 @@ func (o *OIDCProvider) authEndpoint(rw http.ResponseWriter, req *http.Request) {
 
 	aroot := o.getAuthRoot(req)
 	callback := aroot + "/callback"
-	nonce := rand.Int()
+	nonceMax := big.NewInt(math.MaxInt32)
+	nonceVal, err := cryptorand.Int(cryptorand.Reader, nonceMax)
+	if err != nil {
+		log.Error().Err(err).Msg("generating nonce")
+		http.Error(rw, "failed to initialize login", http.StatusInternalServerError)
+		return
+	}
+	nonce := int(nonceVal.Int64())
 	url := discourse.GenerateURL(o.discourseServer, callback, o.discourseSecret, nonce)
 
 	sessionId := uuid.New()
+	expiration := time.Now().Add(time.Minute * 10)
 
 	log.Debug().Str("sessionId", sessionId.String()).Msg("registering in flight request")
-	o.inflight[sessionId] = &InFlightRequest{
-		Nonce: nonce,
-		Ar:    ar,
-	}
-	expiration := time.Now().Add(time.Minute * 10)
-	http.SetCookie(rw, &http.Cookie{
-		Name:    "oidc_session",
-		Value:   sessionId.String(),
-		Expires: time.Now().Add(time.Minute * 10),
+	o.storeInFlight(sessionId, &InFlightRequest{
+		Nonce:     nonce,
+		ExpiresAt: expiration,
+		Ar:        ar,
 	})
-	go func() {
-		time.Sleep(time.Until(expiration))
-		log.Debug().Str("sessionId", sessionId.String()).Msg("deleting expired session id")
-		delete(o.inflight, sessionId)
-	}()
+	isSecure := requestScheme(req) == "https"
+	http.SetCookie(rw, &http.Cookie{
+		Name:     "oidc_session",
+		Value:    sessionId.String(),
+		Path:     o.root,
+		Expires:  expiration,
+		MaxAge:   int((10 * time.Minute).Seconds()),
+		HttpOnly: true,
+		Secure:   isSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
 	http.Redirect(rw, req, url, http.StatusTemporaryRedirect)
 }
 
@@ -70,13 +80,21 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
 		return
 	}
+	sessionID, err := uuid.Parse(cookie.Value)
+	if err != nil {
+		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+		return
+	}
 
-	session, ok := o.inflight[uuid.MustParse(cookie.Value)]
+	session, ok := o.popInFlight(sessionID)
 	if !ok {
 		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
 		return
 	}
-	delete(o.inflight, uuid.MustParse(cookie.Value))
+	if time.Now().After(session.ExpiresAt) {
+		_ = json.NewEncoder(rw).Encode(map[string]string{"error": "invalid session, please try again"})
+		return
+	}
 
 	values, err := discourse.ValidateResponse(req.URL.Query().Get("sso"), req.URL.Query().Get("sig"), o.discourseSecret, session.Nonce)
 	if err != nil {
@@ -84,12 +102,10 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 		return
 	}
 
-	nonce, _ := strconv.Atoi(values.Get("nonce"))
-
 	log.Debug().
 		Str("username", values.Get("username")).
 		Str("groups", values.Get("groups")).
-		Int("nonce", nonce).
+		Str("nonce", values.Get("nonce")).
 		Msg("parsed user data")
 
 	switch client := session.Ar.GetClient().(type) {
@@ -232,9 +248,9 @@ func (o *OIDCProvider) certsEndpoint(rw http.ResponseWriter, req *http.Request) 
 		Keys: []jose.JSONWebKey{
 			{
 				Algorithm: "RS256",
-				KeyID: cryptutils.KeyID(o.privateKey.PublicKey),
-				Use:   "sig",
-				Key:   &o.privateKey.PublicKey,
+				KeyID:     cryptutils.KeyID(o.privateKey.PublicKey),
+				Use:       "sig",
+				Key:       &o.privateKey.PublicKey,
 			},
 		},
 	}
@@ -251,14 +267,14 @@ func (o *OIDCProvider) userInfoEndpoint(rw http.ResponseWriter, req *http.Reques
 		if rfcerr.StatusCode() == http.StatusUnauthorized {
 			rw.Header().Set("WWW-Authenticate", fmt.Sprintf("error=%s,error_description=%s", rfcerr.ErrorField, rfcerr.GetDescription()))
 		}
-		_, _ = rw.Write([]byte(err.Error()))
+		http.Error(rw, "invalid access token", http.StatusUnauthorized)
 		return
 	}
 
 	if tokenType != fosite.AccessToken {
 		err := errors.New("Only Access tokens can be used to fetch user information")
 		rw.Header().Set("WWW-Authenticate", fmt.Sprintf("error_description=%s", err.Error()))
-		_, _ = rw.Write([]byte(err.Error()))
+		http.Error(rw, "invalid access token", http.StatusUnauthorized)
 		return
 	}
 
@@ -270,14 +286,24 @@ func (o *OIDCProvider) userInfoEndpoint(rw http.ResponseWriter, req *http.Reques
 }
 
 func (o *OIDCProvider) getAuthRoot(req *http.Request) string {
-
-	scheme := req.Header.Get("X-Forwarded-Proto")
-	if scheme == "" {
-		scheme = "http"
-	}
-
+	scheme := requestScheme(req)
 	aroot := scheme + "://" + req.Host + o.root
 	return aroot
+}
+
+func requestScheme(req *http.Request) string {
+	if req.TLS != nil {
+		return "https"
+	}
+	parts := strings.Split(req.Header.Get("X-Forwarded-Proto"), ",")
+	if len(parts) == 0 {
+		return "http"
+	}
+	scheme := strings.ToLower(strings.TrimSpace(parts[0]))
+	if scheme == "http" || scheme == "https" {
+		return scheme
+	}
+	return "http"
 }
 
 func validateGroups(client *DistrustClient, values url.Values) error {

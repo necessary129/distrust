@@ -10,7 +10,7 @@ import (
 )
 
 func genkey() {
-	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	priv, err := rsa.GenerateKey(rand.Reader, 3072)
 	if err != nil {
 		log.Fatal(err)
 	}

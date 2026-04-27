@@ -10,6 +10,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/ory/fosite"
@@ -91,8 +92,18 @@ func main() {
 	oidc := auth.NewOIDC("/oauth2", dsettings, toFositeClients(clients), options...)
 	r.Route("/oauth2", oidc.RegisterHandlers)
 
+	srv := &http.Server{
+		Addr:              viper.GetString("listenAddr"),
+		Handler:           r,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+
 	log.Info().Str("url", "http://"+viper.GetString("listenAddr")).Msg("Starting server")
-	log.Fatal().Err(http.ListenAndServe(viper.GetString("listenAddr"), r))
+	log.Fatal().Err(srv.ListenAndServe())
 }
 
 func toFositeClients(clients map[string]clientConfig) map[string]fosite.Client {
@@ -103,7 +114,7 @@ func toFositeClients(clients map[string]clientConfig) map[string]fosite.Client {
 
 		_, err := bcrypt.Cost(hs)
 		if err != nil {
-			hs, _ = bcrypt.GenerateFromPassword(hs, bcrypt.DefaultCost)
+			hs, _ = bcrypt.GenerateFromPassword(hs, 12)
 		}
 
 		r[k] = &auth.DistrustClient{
@@ -112,7 +123,7 @@ func toFositeClients(clients map[string]clientConfig) map[string]fosite.Client {
 				Secret:        hs,
 				RedirectURIs:  v.RedirectURIs,
 				ResponseTypes: []string{"id_token", "code", "token", "id_token token", "code id_token", "code token", "code id_token token"},
-				GrantTypes:    []string{"implicit", "refresh_token", "authorization_code", "password", "client_credentials"},
+				GrantTypes:    []string{"implicit", "refresh_token", "authorization_code", "client_credentials"},
 				Scopes:        []string{"openid", "profile", "email"},
 			},
 			AllowGroups: v.AllowGroups,
