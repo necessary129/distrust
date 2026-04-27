@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
@@ -55,6 +56,7 @@ func main() {
 	zerolog.SetGlobalLevel(lvl)
 
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+	log.Info().Str("goos", runtime.GOOS).Str("goarch", runtime.GOARCH).Msg("runtime environment")
 
 	dsettings := discourse.SSOConfig{
 		Server: viper.GetString("discourse.server"),
