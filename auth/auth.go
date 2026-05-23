@@ -28,6 +28,8 @@ type OIDCProvider struct {
 	oauth2          fosite.OAuth2Provider
 	inflight        map[uuid.UUID]*InFlightRequest
 	inflightMu      sync.Mutex
+	loginSessions   map[uuid.UUID]*LoginSession
+	loginSessionsMu sync.Mutex
 	root            string
 	issuer          string
 	cookieSecure    bool
@@ -58,6 +60,27 @@ type InFlightRequest struct {
 	ExpiresAt time.Time
 	Ar        fosite.AuthorizeRequester
 }
+
+// LoginSession records a successful Discourse SSO authentication so that
+// subsequent /auth requests with prompt=none can mint tokens without a
+// fresh Discourse round-trip. AuthTime is the timestamp recorded at the
+// /callback that established the session and is used as the `auth_time`
+// claim plus the input to fosite's prompt=none/max_age validation.
+type LoginSession struct {
+	AuthTime  time.Time
+	ExpiresAt time.Time
+	Values    url.Values
+}
+
+// loginSessionTTL bounds how long a silent re-authentication can succeed
+// after the last interactive Discourse login. Set to roughly match
+// Discourse's default cookie lifetime so the local session is unlikely
+// to outlive the upstream session it stands in for.
+const loginSessionTTL = 24 * time.Hour
+
+// loginCookieName is the cookie that pins a browser to a LoginSession.
+// Distinct from oidc_session (per-flow, 10-minute) so they coexist.
+const loginCookieName = "distrust_login"
 
 type oidcOptions struct {
 	privateKey    *rsa.PrivateKey
@@ -111,6 +134,7 @@ func NewOIDC(path string, disc discourse.SSOConfig, clients map[string]fosite.Cl
 	provider := &OIDCProvider{
 		oauth2:          compose.ComposeAllEnabled(config, s, oopts.privateKey),
 		inflight:        map[uuid.UUID]*InFlightRequest{},
+		loginSessions:   map[uuid.UUID]*LoginSession{},
 		root:            path,
 		issuer:          strings.TrimRight(oopts.issuer, "/"),
 		cookieSecure:    u.Scheme == "https",
@@ -222,6 +246,40 @@ func (o *OIDCProvider) purgeExpiredInflight(now time.Time) {
 	}
 }
 
+func (o *OIDCProvider) storeLoginSession(sessionID uuid.UUID, s *LoginSession) {
+	o.loginSessionsMu.Lock()
+	defer o.loginSessionsMu.Unlock()
+	o.loginSessions[sessionID] = s
+}
+
+// lookupLoginSession returns the session without consuming it: a single
+// login should be reusable across multiple silent /auth requests within
+// its TTL. Expired entries are returned as (nil, false) and proactively
+// reaped so callers cannot resurrect them.
+func (o *OIDCProvider) lookupLoginSession(sessionID uuid.UUID) (*LoginSession, bool) {
+	o.loginSessionsMu.Lock()
+	defer o.loginSessionsMu.Unlock()
+	s, ok := o.loginSessions[sessionID]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(s.ExpiresAt) {
+		delete(o.loginSessions, sessionID)
+		return nil, false
+	}
+	return s, true
+}
+
+func (o *OIDCProvider) purgeExpiredLoginSessions(now time.Time) {
+	o.loginSessionsMu.Lock()
+	defer o.loginSessionsMu.Unlock()
+	for id, s := range o.loginSessions {
+		if now.After(s.ExpiresAt) {
+			delete(o.loginSessions, id)
+		}
+	}
+}
+
 func (o *OIDCProvider) startInflightJanitor() {
 	o.janitorStop = make(chan struct{})
 	o.janitorDone = make(chan struct{})
@@ -235,6 +293,7 @@ func (o *OIDCProvider) startInflightJanitor() {
 				return
 			case now := <-ticker.C:
 				o.purgeExpiredInflight(now)
+				o.purgeExpiredLoginSessions(now)
 			}
 		}
 	}()
@@ -301,16 +360,17 @@ func (o *OIDCProvider) Shutdown(ctx context.Context) error {
 	}
 }
 
-func (o *OIDCProvider) newSession(aroot string, values url.Values) *openid.DefaultSession {
+func (o *OIDCProvider) newSession(aroot string, values url.Values, authTime time.Time) *openid.DefaultSession {
+	now := time.Now()
 	return &openid.DefaultSession{
 		Claims: &jwt.IDTokenClaims{
 			Issuer:      aroot,
 			Subject:     values.Get("external_id"),
 			Audience:    []string{},
-			ExpiresAt:   time.Now().Add(time.Hour * 6),
-			IssuedAt:    time.Now(),
-			RequestedAt: time.Now(),
-			AuthTime:    time.Now(),
+			ExpiresAt:   now.Add(time.Hour * 6),
+			IssuedAt:    now,
+			RequestedAt: now,
+			AuthTime:    authTime,
 			Extra: map[string]interface{}{
 				"email":              values.Get("email"),
 				"email_verified":     parseEmailVerified(values.Get("email_verified")),

@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,16 @@ func (o *OIDCProvider) authEndpoint(rw http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		log.Warn().Err(err).Msg("parsing authorize request")
 		o.oauth2.WriteAuthorizeError(ctx, rw, ar, err)
+		return
+	}
+
+	// OIDC `prompt=none` forbids any user-visible interaction. Discourse's
+	// SSO provider has no quiet-failure mode, so a bounce to Discourse can
+	// surface its login UI and violate the spec. Honour it locally: if we
+	// have a recent LoginSession for this browser we replay it; otherwise
+	// we redirect back to the RP with error=login_required immediately.
+	if hasPromptNone(ar) {
+		o.handlePromptNone(ctx, rw, req, ar)
 		return
 	}
 
@@ -106,11 +117,67 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 		Str("groups", values.Get("groups")).
 		Msg("parsed user data")
 
-	switch client := session.Ar.GetClient().(type) {
+	// Pin authTime to a single instant so the LoginSession, the cookie,
+	// and the id_token's auth_time claim all agree.
+	authTime := time.Now()
+
+	// Issue the long-lived login session before WriteAuthorizeResponse so a
+	// subsequent silent /auth?prompt=none can replay it. If cookie write
+	// fails the silent path simply won't be available; the interactive
+	// flow is still complete.
+	o.issueLoginCookie(rw, authTime, values)
+
+	o.completeAuthorize(ctx, rw, session.Ar, values, authTime)
+}
+
+// hasPromptNone reports whether the OIDC `prompt` parameter contained
+// the `none` token. fosite validates that `none` is not combined with
+// other prompt values at request creation time, so a presence check is
+// sufficient here.
+func hasPromptNone(ar fosite.AuthorizeRequester) bool {
+	for _, p := range strings.Fields(ar.GetRequestForm().Get("prompt")) {
+		if p == "none" {
+			return true
+		}
+	}
+	return false
+}
+
+// handlePromptNone services the silent-authentication branch of /auth.
+// If a valid LoginSession is bound to the browser, we replay the cached
+// Discourse identity through fosite without ever bouncing to Discourse.
+// Otherwise we send the RP an `error=login_required` redirect, per OIDC
+// Core §3.1.2.6.
+func (o *OIDCProvider) handlePromptNone(ctx context.Context, rw http.ResponseWriter, req *http.Request, ar fosite.AuthorizeRequester) {
+	loginSession, ok := o.lookupLoginSessionFromRequest(req)
+	if !ok {
+		log.Debug().Msg("prompt=none without active login session, returning login_required")
+		o.oauth2.WriteAuthorizeError(ctx, rw, ar, fosite.ErrLoginRequired)
+		return
+	}
+
+	if err := validateDiscoursePayload(loginSession.Values); err != nil {
+		// The cached payload was validated when it was stored; this would
+		// only fail if the validation rules tightened across a restart, in
+		// which case forcing a fresh login is the correct outcome.
+		log.Warn().Err(err).Msg("cached login session payload no longer valid, returning login_required")
+		o.oauth2.WriteAuthorizeError(ctx, rw, ar, fosite.ErrLoginRequired)
+		return
+	}
+
+	o.completeAuthorize(ctx, rw, ar, loginSession.Values, loginSession.AuthTime)
+}
+
+// completeAuthorize finalises an authorize request once a Discourse
+// identity is available. Shared by /callback (fresh login) and the
+// prompt=none silent path on /auth. authTime is the moment the user
+// actually authenticated against Discourse and feeds the `auth_time`
+// claim plus fosite's prompt/max_age validation.
+func (o *OIDCProvider) completeAuthorize(ctx context.Context, rw http.ResponseWriter, ar fosite.AuthorizeRequester, values url.Values, authTime time.Time) {
+	switch client := ar.GetClient().(type) {
 	case *DistrustClient:
 		log.Debug().Str("client", client.GetID()).Msg("distrust client found, performing additonal validation")
-		err := validateGroups(client, values)
-		if err != nil {
+		if err := validateGroups(client, values); err != nil {
 			log.Warn().Err(err).Msg("group validation failed")
 			http.Error(rw, "Access denied", http.StatusForbidden)
 			return
@@ -118,38 +185,67 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 	}
 
 	// since scopes do not work with discourse, we simply grant the openid scope
-	session.Ar.GrantScope("openid")
+	ar.GrantScope("openid")
 
-	// Now we need to get a response. This is the place where the AuthorizeEndpointHandlers kick in and start processing the request.
-	// NewAuthorizeResponse is capable of running multiple response type handlers which in turn enables this library
-	// to support open id connect.
-
-	mySessionData := o.newSession(o.issuer, values)
+	mySessionData := o.newSession(o.issuer, values, authTime)
 	// H1: bind the audience to this client at the authorize step. The session
 	// is persisted and re-loaded on /token, /introspect and /userinfo, so
 	// setting it here is sufficient for all downstream code paths.
-	mySessionData.Claims.Audience = []string{session.Ar.GetClient().GetID()}
-	response, err := o.oauth2.NewAuthorizeResponse(req.Context(), session.Ar, mySessionData)
-
-	// Catch any errors, e.g.:
-	// * unknown client
-	// * invalid redirect
-	// * ...
+	mySessionData.Claims.Audience = []string{ar.GetClient().GetID()}
+	response, err := o.oauth2.NewAuthorizeResponse(ctx, ar, mySessionData)
 	if err != nil {
 		log.Warn().Err(err).Msg("building authorize response")
-		o.oauth2.WriteAuthorizeError(ctx, rw, session.Ar, err)
+		o.oauth2.WriteAuthorizeError(ctx, rw, ar, err)
 		return
 	}
 
-	// Last but not least, send the response!
-	o.oauth2.WriteAuthorizeResponse(ctx, rw, session.Ar, response)
+	o.oauth2.WriteAuthorizeResponse(ctx, rw, ar, response)
+}
+
+// issueLoginCookie records a fresh LoginSession server-side and binds
+// the browser to it with the distrust_login cookie. Called from
+// /callback once the Discourse response is verified.
+func (o *OIDCProvider) issueLoginCookie(rw http.ResponseWriter, authTime time.Time, values url.Values) {
+	id := uuid.New()
+	expires := authTime.Add(loginSessionTTL)
+	o.storeLoginSession(id, &LoginSession{
+		AuthTime:  authTime,
+		ExpiresAt: expires,
+		Values:    values,
+	})
+	http.SetCookie(rw, &http.Cookie{
+		Name:     loginCookieName,
+		Value:    id.String(),
+		Path:     o.root,
+		Expires:  expires,
+		MaxAge:   int(loginSessionTTL.Seconds()),
+		HttpOnly: true,
+		Secure:   o.cookieSecure,
+		SameSite: http.SameSiteLaxMode,
+	})
+}
+
+// lookupLoginSessionFromRequest resolves the distrust_login cookie to a
+// live LoginSession, returning (nil, false) for any unparseable, unknown
+// or expired identifier so callers can fold all failures into a single
+// `login_required` response.
+func (o *OIDCProvider) lookupLoginSessionFromRequest(req *http.Request) (*LoginSession, bool) {
+	cookie, err := req.Cookie(loginCookieName)
+	if err != nil {
+		return nil, false
+	}
+	id, err := uuid.Parse(cookie.Value)
+	if err != nil {
+		return nil, false
+	}
+	return o.lookupLoginSession(id)
 }
 
 func (o *OIDCProvider) introspectionEndpoint(rw http.ResponseWriter, req *http.Request) {
 	// This context will be passed to all methods.
 	ctx := req.Context()
 
-	mySessionData := o.newSession(o.issuer, nil)
+	mySessionData := o.newSession(o.issuer, nil, time.Time{})
 	ir, err := o.oauth2.NewIntrospectionRequest(ctx, req, mySessionData)
 	if err != nil {
 		log.Warn().Err(err).Msg("introspection request failed")
@@ -176,7 +272,7 @@ func (o *OIDCProvider) tokenEndpoint(rw http.ResponseWriter, req *http.Request) 
 	ctx := req.Context()
 
 	// Create an empty session object which will be passed to the request handlers
-	mySessionData := o.newSession(o.issuer, nil)
+	mySessionData := o.newSession(o.issuer, nil, time.Time{})
 
 	// This will create an access request object and iterate through the registered TokenEndpointHandlers to validate the request.
 	accessRequest, err := o.oauth2.NewAccessRequest(ctx, req, mySessionData)
@@ -228,7 +324,7 @@ func (o *OIDCProvider) certsEndpoint(rw http.ResponseWriter, req *http.Request) 
 }
 
 func (o *OIDCProvider) userInfoEndpoint(rw http.ResponseWriter, req *http.Request) {
-	session := o.newSession(o.issuer, nil)
+	session := o.newSession(o.issuer, nil, time.Time{})
 	tokenType, ar, err := o.oauth2.IntrospectToken(req.Context(), fosite.AccessTokenFromRequest(req), fosite.AccessToken, session)
 	if err != nil {
 		rfcerr := fosite.ErrorToRFC6749Error(err)

@@ -191,6 +191,224 @@ func TestCallbackEndpointSuccessAndReplayRejection(t *testing.T) {
 	}
 }
 
+func TestPromptNoneWithoutSessionReturnsLoginRequired(t *testing.T) {
+	_, router := newIntegrationProviderAndRouter(t)
+
+	u := "/oauth2/auth?client_id=test-client&response_type=code&scope=openid&state=state-123456789&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&prompt=none"
+	req := httptest.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	res := httptest.NewRecorder()
+
+	router.ServeHTTP(res, req)
+
+	if res.Code < 300 || res.Code >= 400 {
+		t.Fatalf("expected redirect status, got %d", res.Code)
+	}
+	loc := res.Header().Get("Location")
+	if !strings.HasPrefix(loc, "https://client.example/callback") {
+		t.Fatalf("expected redirect to client redirect_uri, got %q", loc)
+	}
+	if !strings.Contains(loc, "error=login_required") {
+		t.Fatalf("expected error=login_required in redirect, got %q", loc)
+	}
+	if strings.Contains(loc, "forum.example") {
+		t.Fatalf("prompt=none must not bounce to Discourse, got %q", loc)
+	}
+}
+
+func TestCallbackIssuesLoginCookieAndSilentReauth(t *testing.T) {
+	provider, router := newIntegrationProviderAndRouter(t)
+
+	// Drive a full interactive login so the provider issues a
+	// distrust_login cookie we can use for the silent re-auth check.
+	authURL := "/oauth2/auth?client_id=test-client&response_type=code&scope=openid&state=state-123456789&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback"
+	authReq := httptest.NewRequest(http.MethodGet, authURL, nil)
+	authReq.Header.Set("X-Forwarded-Proto", "https")
+	authRes := httptest.NewRecorder()
+	router.ServeHTTP(authRes, authReq)
+
+	var oidcCookie *http.Cookie
+	for _, c := range authRes.Result().Cookies() {
+		if c.Name == "oidc_session" {
+			oidcCookie = c
+		}
+	}
+	if oidcCookie == nil {
+		t.Fatal("expected oidc_session cookie from auth endpoint")
+	}
+	sessionID, err := uuid.Parse(oidcCookie.Value)
+	if err != nil {
+		t.Fatalf("invalid session id cookie: %v", err)
+	}
+	provider.inflightMu.Lock()
+	inflightReq, ok := provider.inflight[sessionID]
+	provider.inflightMu.Unlock()
+	if !ok {
+		t.Fatal("expected in-flight session to be registered")
+	}
+
+	payload := "nonce=" + url.QueryEscape(inflightReq.Nonce) +
+		"&external_id=1&username=alice&email=alice%40example.org&name=Alice&groups=team"
+	sso, sig := signDiscourseSSO(t, "disc-secret", payload)
+	q := url.Values{}
+	q.Set("sso", sso)
+	q.Set("sig", sig)
+
+	cbReq := httptest.NewRequest(http.MethodGet, "/oauth2/callback?"+q.Encode(), nil)
+	cbReq.Header.Set("X-Forwarded-Proto", "https")
+	cbReq.AddCookie(oidcCookie)
+	cbRes := httptest.NewRecorder()
+	router.ServeHTTP(cbRes, cbReq)
+	if cbRes.Code < 300 || cbRes.Code >= 400 {
+		t.Fatalf("expected redirect status from callback, got %d", cbRes.Code)
+	}
+
+	var loginCookie *http.Cookie
+	for _, c := range cbRes.Result().Cookies() {
+		if c.Name == loginCookieName {
+			loginCookie = c
+		}
+	}
+	if loginCookie == nil {
+		t.Fatal("expected distrust_login cookie to be set on successful callback")
+	}
+	if !loginCookie.HttpOnly {
+		t.Fatal("distrust_login cookie must be HttpOnly")
+	}
+	if !loginCookie.Secure {
+		t.Fatal("distrust_login cookie must be Secure on https issuer")
+	}
+	if loginCookie.SameSite != http.SameSiteLaxMode {
+		t.Fatalf("distrust_login SameSite mismatch: got %v", loginCookie.SameSite)
+	}
+	if loginCookie.Path != "/oauth2" {
+		t.Fatalf("distrust_login path mismatch: got %q", loginCookie.Path)
+	}
+
+	// Replay the silent flow: /auth?prompt=none with the login cookie.
+	// Expect a code redirect to the client without touching Discourse.
+	silentURL := "/oauth2/auth?client_id=test-client&response_type=code&scope=openid&state=state-987654321&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&prompt=none"
+	silentReq := httptest.NewRequest(http.MethodGet, silentURL, nil)
+	silentReq.Header.Set("X-Forwarded-Proto", "https")
+	silentReq.AddCookie(loginCookie)
+	silentRes := httptest.NewRecorder()
+	router.ServeHTTP(silentRes, silentReq)
+
+	if silentRes.Code < 300 || silentRes.Code >= 400 {
+		t.Fatalf("expected redirect from silent /auth, got %d (body=%q)", silentRes.Code, silentRes.Body.String())
+	}
+	loc := silentRes.Header().Get("Location")
+	if !strings.HasPrefix(loc, "https://client.example/callback") {
+		t.Fatalf("silent flow must redirect to RP, got %q", loc)
+	}
+	if strings.Contains(loc, "forum.example") {
+		t.Fatalf("silent flow must not bounce to Discourse, got %q", loc)
+	}
+	if strings.Contains(loc, "error=") {
+		t.Fatalf("silent flow returned error: %q", loc)
+	}
+	if !strings.Contains(loc, "code=") {
+		t.Fatalf("silent flow did not return an authorization code: %q", loc)
+	}
+}
+
+func TestPromptNoneWithExpiredSessionReturnsLoginRequired(t *testing.T) {
+	provider, router := newIntegrationProviderAndRouter(t)
+
+	id := uuid.New()
+	provider.storeLoginSession(id, &LoginSession{
+		AuthTime:  time.Now().Add(-25 * time.Hour),
+		ExpiresAt: time.Now().Add(-time.Second),
+		Values: url.Values{
+			"external_id": {"1"},
+			"username":    {"alice"},
+		},
+	})
+
+	u := "/oauth2/auth?client_id=test-client&response_type=code&scope=openid&state=state-123456789&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&prompt=none"
+	req := httptest.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.AddCookie(&http.Cookie{Name: loginCookieName, Value: id.String()})
+	res := httptest.NewRecorder()
+
+	router.ServeHTTP(res, req)
+
+	if res.Code < 300 || res.Code >= 400 {
+		t.Fatalf("expected redirect status, got %d", res.Code)
+	}
+	loc := res.Header().Get("Location")
+	if !strings.Contains(loc, "error=login_required") {
+		t.Fatalf("expected login_required for expired session, got %q", loc)
+	}
+
+	// Expired entry must also be reaped from the map on lookup so a
+	// future request cannot resurrect it by racing the janitor.
+	provider.loginSessionsMu.Lock()
+	_, stillPresent := provider.loginSessions[id]
+	provider.loginSessionsMu.Unlock()
+	if stillPresent {
+		t.Fatal("expected expired login session to be removed on lookup")
+	}
+}
+
+func TestPromptNoneSilentPathEnforcesDenyGroups(t *testing.T) {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate test private key: %v", err)
+	}
+
+	clients := map[string]fosite.Client{
+		"deny-client": &DistrustClient{
+			DefaultClient: fosite.DefaultClient{
+				ID:            "deny-client",
+				Secret:        []byte("unused"),
+				RedirectURIs:  []string{"https://client.example/callback"},
+				ResponseTypes: []string{"code"},
+				GrantTypes:    []string{"authorization_code"},
+				Scopes:        []string{"openid"},
+			},
+			DenyGroups: []string{"banned"},
+		},
+	}
+
+	provider, err := NewOIDC(
+		"/oauth2",
+		discourse.SSOConfig{Server: "https://forum.example", Secret: "disc-secret"},
+		clients,
+		WithIssuer("https://distrust.example/oauth2"),
+		WithPrivateKey(priv),
+		WithSecret([]byte("0123456789abcdef0123456789abcdef")),
+	)
+	if err != nil {
+		t.Fatalf("failed to construct provider: %v", err)
+	}
+	router := chi.NewRouter()
+	router.Route("/oauth2", provider.RegisterHandlers)
+
+	id := uuid.New()
+	provider.storeLoginSession(id, &LoginSession{
+		AuthTime:  time.Now().Add(-time.Hour),
+		ExpiresAt: time.Now().Add(time.Hour),
+		Values: url.Values{
+			"external_id": {"1"},
+			"username":    {"alice"},
+			"groups":      {"banned"},
+		},
+	})
+
+	u := "/oauth2/auth?client_id=deny-client&response_type=code&scope=openid&state=state-123456789&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback&prompt=none"
+	req := httptest.NewRequest(http.MethodGet, u, nil)
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.AddCookie(&http.Cookie{Name: loginCookieName, Value: id.String()})
+	res := httptest.NewRecorder()
+
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from silent path with banned group, got %d (body=%q)", res.Code, res.Body.String())
+	}
+}
+
 func TestCallbackEndpointRejectsExpiredSession(t *testing.T) {
 	provider, router := newIntegrationProviderAndRouter(t)
 
