@@ -5,6 +5,12 @@ log:
 discourse:
   server: https://meta.discourse.com
   secret: <replace-me>
+  # Optional shared secret for the Discourse webhook receiver. When set,
+  # distrust exposes /oauth2/webhook and invalidates cached login
+  # sessions on user_logged_out / user_destroyed / user_suspended /
+  # user_anonymized events. Configure the matching secret in Discourse
+  # under Admin → API → Webhooks.
+  # webhookSecret: <replace-me>
 oidc:
   # The issuer URL advertised in OIDC discovery and ID tokens.
   # Must be the public base URL of the /oauth2 path of this server.
@@ -22,6 +28,13 @@ oidc:
     -----BEGIN RSA PRIVATE KEY-----
     <replace-me>
     -----END RSA PRIVATE KEY-----
+
+  # Optional path to a SQLite database for silent-login session
+  # persistence. When unset, sessions live in process memory and are
+  # lost on restart — `prompt=none` then degrades to `login_required`
+  # until the user re-authenticates interactively. The file is opened
+  # in WAL mode; the directory must be writable by the distrust user.
+  # sessionDB: /var/lib/distrust/sessions.db
 
 # Optional list of trusted reverse-proxy CIDRs/IPs.
 # Only requests originating from these addresses may set X-Forwarded-Proto.

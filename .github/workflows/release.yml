@@ -3,7 +3,7 @@ name: release
 on:
   push:
     branches:
-      - '**'
+      - master
     tags:
       - 'v*'
 
@@ -17,9 +17,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
@@ -51,6 +48,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Clear
-        if: always()
-        run: rm -f ${HOME}/.docker/config.json
+          provenance: true
+

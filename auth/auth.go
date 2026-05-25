@@ -22,14 +22,15 @@ import (
 	"github.com/ory/fosite/token/jwt"
 	"github.com/parkour-vienna/distrust/cryptutils"
 	"github.com/parkour-vienna/distrust/discourse"
+	"github.com/rs/zerolog/log"
 )
 
 type OIDCProvider struct {
 	oauth2          fosite.OAuth2Provider
 	inflight        map[uuid.UUID]*InFlightRequest
 	inflightMu      sync.Mutex
-	loginSessions   map[uuid.UUID]*LoginSession
-	loginSessionsMu sync.Mutex
+	loginStore      LoginSessionStore
+	webhookSecret   []byte
 	root            string
 	issuer          string
 	cookieSecure    bool
@@ -87,6 +88,8 @@ type oidcOptions struct {
 	secret        []byte
 	issuer        string
 	authRateLimit func(http.Handler) http.Handler
+	sessionDB     string
+	webhookSecret []byte
 }
 
 type funcOIDCOption struct {
@@ -131,10 +134,22 @@ func NewOIDC(path string, disc discourse.SSOConfig, clients map[string]fosite.Cl
 		AccessTokenLifespan: time.Minute * 30,
 		GlobalSecret:        oopts.secret,
 	}
+	var loginStore LoginSessionStore
+	if oopts.sessionDB != "" {
+		ls, err := newSQLiteSessionStore(oopts.sessionDB)
+		if err != nil {
+			return nil, fmt.Errorf("opening session db: %w", err)
+		}
+		loginStore = ls
+	} else {
+		loginStore = newMemorySessionStore()
+	}
+
 	provider := &OIDCProvider{
 		oauth2:          compose.ComposeAllEnabled(config, s, oopts.privateKey),
 		inflight:        map[uuid.UUID]*InFlightRequest{},
-		loginSessions:   map[uuid.UUID]*LoginSession{},
+		loginStore:      loginStore,
+		webhookSecret:   oopts.webhookSecret,
 		root:            path,
 		issuer:          strings.TrimRight(oopts.issuer, "/"),
 		cookieSecure:    u.Scheme == "https",
@@ -145,6 +160,7 @@ func NewOIDC(path string, disc discourse.SSOConfig, clients map[string]fosite.Cl
 		authRateLimit:   oopts.authRateLimit,
 	}
 	if err := provider.precomputeDiscovery(); err != nil {
+		_ = loginStore.Close()
 		return nil, fmt.Errorf("precomputing discovery document: %w", err)
 	}
 	provider.startInflightJanitor()
@@ -187,6 +203,29 @@ func WithAuthRateLimiter(mw func(http.Handler) http.Handler) OIDCOption {
 	}
 }
 
+// WithSessionDB enables SQLite-backed persistence of login sessions
+// (the records that back silent prompt=none re-authentication). If
+// unset, sessions live in process memory and are lost on restart.
+func WithSessionDB(path string) OIDCOption {
+	return &funcOIDCOption{
+		func(o *oidcOptions) {
+			o.sessionDB = path
+		},
+	}
+}
+
+// WithDiscourseWebhook enables the /webhook endpoint and sets the
+// shared secret used to verify the X-Discourse-Event-Signature
+// header on incoming events. Supply the same string configured in
+// Discourse's webhook UI. Empty disables the endpoint.
+func WithDiscourseWebhook(secret string) OIDCOption {
+	return &funcOIDCOption{
+		func(o *oidcOptions) {
+			o.webhookSecret = []byte(secret)
+		},
+	}
+}
+
 // maxOAuthRequestBodyBytes caps the size of POST request bodies on OAuth2
 // endpoints. 64 KiB is far above any legitimate token/introspect/revoke payload
 // (well under typical assertion sizes used in client_credentials grants too)
@@ -218,6 +257,12 @@ func (o *OIDCProvider) RegisterHandlers(r chi.Router) {
 
 	r.Get("/.well-known/openid-configuration", o.informationEndpoint)
 	r.Get("/certs", o.certsEndpoint)
+
+	// Only expose the webhook receiver if a shared secret was supplied,
+	// so a misconfigured deployment can't accept unsigned event posts.
+	if len(o.webhookSecret) > 0 {
+		r.Post("/webhook", limitBody(o.webhookEndpoint))
+	}
 }
 
 func (o *OIDCProvider) storeInFlight(sessionID uuid.UUID, req *InFlightRequest) {
@@ -247,36 +292,25 @@ func (o *OIDCProvider) purgeExpiredInflight(now time.Time) {
 }
 
 func (o *OIDCProvider) storeLoginSession(sessionID uuid.UUID, s *LoginSession) {
-	o.loginSessionsMu.Lock()
-	defer o.loginSessionsMu.Unlock()
-	o.loginSessions[sessionID] = s
+	if err := o.loginStore.Store(sessionID, s); err != nil {
+		// The interactive flow has already completed; failing to write
+		// the silent-auth session only degrades a future prompt=none to
+		// login_required, which is the correct fallback.
+		log.Warn().Err(err).Msg("login session store failed")
+	}
 }
 
 // lookupLoginSession returns the session without consuming it: a single
 // login should be reusable across multiple silent /auth requests within
 // its TTL. Expired entries are returned as (nil, false) and proactively
-// reaped so callers cannot resurrect them.
+// reaped by the store so callers cannot resurrect them.
 func (o *OIDCProvider) lookupLoginSession(sessionID uuid.UUID) (*LoginSession, bool) {
-	o.loginSessionsMu.Lock()
-	defer o.loginSessionsMu.Unlock()
-	s, ok := o.loginSessions[sessionID]
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(s.ExpiresAt) {
-		delete(o.loginSessions, sessionID)
-		return nil, false
-	}
-	return s, true
+	return o.loginStore.Lookup(sessionID)
 }
 
 func (o *OIDCProvider) purgeExpiredLoginSessions(now time.Time) {
-	o.loginSessionsMu.Lock()
-	defer o.loginSessionsMu.Unlock()
-	for id, s := range o.loginSessions {
-		if now.After(s.ExpiresAt) {
-			delete(o.loginSessions, id)
-		}
+	if err := o.loginStore.PurgeExpired(now); err != nil {
+		log.Warn().Err(err).Msg("login session purge failed")
 	}
 }
 
@@ -340,24 +374,29 @@ func (o *OIDCProvider) precomputeDiscovery() error {
 	return nil
 }
 
-// Shutdown stops the in-flight-request janitor and waits for it to exit.
-// Idempotent and safe to call from a signal handler.
+// Shutdown stops the in-flight-request janitor and waits for it to exit,
+// then closes the login-session store. Idempotent and safe to call from
+// a signal handler.
 func (o *OIDCProvider) Shutdown(ctx context.Context) error {
-	if o.janitorStop == nil {
-		return nil
+	if o.janitorStop != nil {
+		select {
+		case <-o.janitorStop:
+			// already closed
+		default:
+			close(o.janitorStop)
+		}
+		select {
+		case <-o.janitorDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
-	select {
-	case <-o.janitorStop:
-		// already closed
-	default:
-		close(o.janitorStop)
+	if o.loginStore != nil {
+		if err := o.loginStore.Close(); err != nil {
+			return fmt.Errorf("closing login session store: %w", err)
+		}
 	}
-	select {
-	case <-o.janitorDone:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return nil
 }
 
 func (o *OIDCProvider) newSession(aroot string, values url.Values, authTime time.Time) *openid.DefaultSession {

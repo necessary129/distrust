@@ -341,12 +341,9 @@ func TestPromptNoneWithExpiredSessionReturnsLoginRequired(t *testing.T) {
 		t.Fatalf("expected login_required for expired session, got %q", loc)
 	}
 
-	// Expired entry must also be reaped from the map on lookup so a
-	// future request cannot resurrect it by racing the janitor.
-	provider.loginSessionsMu.Lock()
-	_, stillPresent := provider.loginSessions[id]
-	provider.loginSessionsMu.Unlock()
-	if stillPresent {
+	// Expired entry must also be reaped on lookup so a future request
+	// cannot resurrect it by racing the janitor.
+	if _, ok := provider.loginStore.Lookup(id); ok {
 		t.Fatal("expected expired login session to be removed on lookup")
 	}
 }

@@ -112,7 +112,7 @@ func main() {
 	}
 	log.Info().Int("numClients", len(fclients)).Msg("clients loaded")
 
-	oidc, err := auth.NewOIDC("/oauth2", dsettings, fclients,
+	oidcOpts := []auth.OIDCOption{
 		auth.WithIssuer(issuer),
 		auth.WithPrivateKey(priv),
 		auth.WithSecret([]byte(secret)),
@@ -121,7 +121,16 @@ func main() {
 		// (each /auth → /callback round-trip uses two requests) but cuts off
 		// brute-force enumeration of nonces or session IDs.
 		auth.WithAuthRateLimiter(httprate.LimitByIP(30, time.Minute)),
-	)
+	}
+	if dbPath := viper.GetString("oidc.sessionDB"); dbPath != "" {
+		oidcOpts = append(oidcOpts, auth.WithSessionDB(dbPath))
+		log.Info().Str("path", dbPath).Msg("login sessions persisted to sqlite")
+	}
+	if whSecret := viper.GetString("discourse.webhookSecret"); whSecret != "" {
+		oidcOpts = append(oidcOpts, auth.WithDiscourseWebhook(whSecret))
+		log.Info().Msg("discourse webhook endpoint enabled")
+	}
+	oidc, err := auth.NewOIDC("/oauth2", dsettings, fclients, oidcOpts...)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to construct OIDC provider")
 	}

@@ -104,3 +104,31 @@ The two endpoints the client will interact with are:
 * The token endpoint
   * `https://example.com/oauth2/token`
 
+### Silent re-authentication (`prompt=none`)
+
+distrust honours the OIDC `prompt=none` parameter without ever showing
+Discourse's login UI. On a successful interactive login it sets a
+`distrust_login` cookie and (when `oidc.sessionDB` is configured)
+persists the session in SQLite; subsequent `prompt=none` requests
+within 24 hours replay that session and return tokens without bouncing
+through Discourse. Configure `oidc.sessionDB` to keep silent re-auth
+working across restarts.
+
+**Known limitation.** distrust can only honour silent re-auth for
+browsers that have completed at least one interactive login against
+*this* distrust instance. A user who is logged into Discourse but has
+never used distrust will receive `error=login_required` on a
+`prompt=none` request — there is no server-side way to peek at the
+upstream Discourse session without bouncing the browser through
+Discourse's login page, which would violate the spec.
+
+### Discourse logout sync (optional webhook)
+
+To invalidate cached login sessions when a user logs out of (or is
+banned from) Discourse, set `discourse.webhookSecret` and configure a
+matching webhook in Discourse under **Admin → API → Webhooks** pointed
+at `https://example.com/oauth2/webhook`. Enable the *User Event* type.
+distrust verifies the `X-Discourse-Event-Signature` header and acts on
+`user_logged_out`, `user_destroyed`, `user_suspended`, and
+`user_anonymized` events; other events are acknowledged and ignored.
+
