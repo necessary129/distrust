@@ -127,7 +127,7 @@ func TestSQLiteStorePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open 2: %v", err)
 	}
-	defer store2.Close()
+	defer func() { _ = store2.Close() }()
 	got, ok := store2.Lookup(id)
 	if !ok {
 		t.Fatal("expected session to persist across reopen")

@@ -91,7 +91,7 @@ func TestAuthEndpointSetsCookieSecurityAttributes(t *testing.T) {
 	}
 
 	result := res.Result()
-	defer result.Body.Close()
+	defer func() { _ = result.Body.Close() }()
 	var sessionCookie *http.Cookie
 	for _, c := range result.Cookies() {
 		if c.Name == "oidc_session" {
