@@ -339,7 +339,10 @@ func (o *OIDCProvider) precomputeDiscovery() error {
 		"authorization_endpoint": o.issuer + "/auth",
 		"token_endpoint":         o.issuer + "/token",
 		"userinfo_endpoint":      o.issuer + "/userinfo",
+		"introspection_endpoint": o.issuer + "/introspect",
+		"revocation_endpoint":    o.issuer + "/revoke",
 		"jwks_uri":               o.issuer + "/certs",
+		"scopes_supported":       []string{"openid", "profile", "email"},
 		"response_types_supported": []string{
 			"code",
 			"none",
@@ -349,8 +352,34 @@ func (o *OIDCProvider) precomputeDiscovery() error {
 			"code id_token",
 			"code id_token token",
 		},
+		"response_modes_supported": []string{"query", "fragment"},
+		"grant_types_supported": []string{
+			"authorization_code",
+			"implicit",
+			"refresh_token",
+			"client_credentials",
+		},
 		"subject_types_supported":               []string{"public", "pairwise"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
+		"token_endpoint_auth_methods_supported": []string{
+			"client_secret_basic",
+			"client_secret_post",
+		},
+		"code_challenge_methods_supported": []string{"S256", "plain"},
+		"claims_supported": []string{
+			"iss",
+			"sub",
+			"aud",
+			"exp",
+			"iat",
+			"auth_time",
+			"email",
+			"email_verified",
+			"name",
+			"preferred_username",
+			"picture",
+			"groups",
+		},
 	}
 	dj, err := json.Marshal(discovery)
 	if err != nil {

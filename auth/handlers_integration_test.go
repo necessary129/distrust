@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -426,3 +427,57 @@ func TestCallbackEndpointRejectsExpiredSession(t *testing.T) {
 	}
 }
 
+func TestDiscoveryEndpointAdvertisesEndpointsAndCapabilities(t *testing.T) {
+	_, router := newIntegrationProviderAndRouter(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/.well-known/openid-configuration", nil)
+	res := httptest.NewRecorder()
+
+	router.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status mismatch: got %d want %d", res.Code, http.StatusOK)
+	}
+	if ct := res.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("content-type mismatch: got %q want application/json", ct)
+	}
+
+	var doc map[string]interface{}
+	if err := json.Unmarshal(res.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("failed to decode discovery document: %v", err)
+	}
+
+	const issuer = "https://distrust.example/oauth2"
+	wantStrings := map[string]string{
+		"issuer":                 issuer,
+		"authorization_endpoint": issuer + "/auth",
+		"token_endpoint":         issuer + "/token",
+		"userinfo_endpoint":      issuer + "/userinfo",
+		"introspection_endpoint": issuer + "/introspect",
+		"revocation_endpoint":    issuer + "/revoke",
+		"jwks_uri":               issuer + "/certs",
+	}
+	for k, want := range wantStrings {
+		got, ok := doc[k].(string)
+		if !ok || got != want {
+			t.Errorf("discovery[%q] = %v, want %q", k, doc[k], want)
+		}
+	}
+
+	for _, k := range []string{
+		"scopes_supported",
+		"response_types_supported",
+		"response_modes_supported",
+		"grant_types_supported",
+		"subject_types_supported",
+		"id_token_signing_alg_values_supported",
+		"token_endpoint_auth_methods_supported",
+		"code_challenge_methods_supported",
+		"claims_supported",
+	} {
+		arr, ok := doc[k].([]interface{})
+		if !ok || len(arr) == 0 {
+			t.Errorf("discovery[%q] missing or empty: %v", k, doc[k])
+		}
+	}
+}
