@@ -91,6 +91,23 @@ In case you want your client to be only available for members of a certain
 group, you can populate the `allowGroups` or `denyGroups` fields in the client
 config. This will either allow or deny access on a client basis.
 
+### Running behind a reverse proxy
+
+distrust only speaks plain HTTP, so it normally runs behind a TLS-terminating
+proxy. List that proxy in `trustedProxies` so distrust can read the real
+client address from `X-Forwarded-For`:
+
+```yaml
+trustedProxies:
+  - 127.0.0.1
+  - 10.0.0.0/8
+```
+
+Without it, every request appears to come from the proxy and the per-IP
+limits on login (`/auth`, `/callback`) and on failed client authentication
+(`/token`, `/introspect`, `/revoke`) are shared by all users. distrust logs a
+warning if it sees `X-Forwarded-For` while `trustedProxies` is unset.
+
 ### Usage by Clients
 
 Distrust is based on [ory/fosite](https://github.com/ory/fosite), so you can 

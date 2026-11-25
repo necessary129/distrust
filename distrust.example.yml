@@ -36,8 +36,13 @@ oidc:
   # in WAL mode; the directory must be writable by the distrust user.
   # sessionDB: /var/lib/distrust/sessions.db
 
-# Optional list of trusted reverse-proxy CIDRs/IPs.
-# Only requests originating from these addresses may set X-Forwarded-Proto.
+# Reverse proxies (CIDRs or IPs) allowed to report the client address via
+# X-Forwarded-For. Required when distrust runs behind a proxy: per-IP rate
+# limits otherwise see every user as the proxy's address and share one
+# bucket, so a single client can lock everyone out of logging in.
+# The proxy must append the client address to X-Forwarded-For (Caddy and
+# Traefik do by default; nginx needs
+# `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`).
 # Leave empty (or omit) when running directly without a proxy.
 # trustedProxies:
 #   - 127.0.0.1/32

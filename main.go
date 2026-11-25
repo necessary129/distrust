@@ -21,6 +21,7 @@ import (
 	"github.com/ory/fosite"
 	"github.com/parkour-vienna/distrust/auth"
 	"github.com/parkour-vienna/distrust/discourse"
+	"github.com/parkour-vienna/distrust/realip"
 	"github.com/parkour-vienna/distrust/requestlog"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -74,8 +75,16 @@ func main() {
 		Secret: viper.GetString("discourse.secret"),
 	}
 
+	trustedProxies, err := realip.ParsePrefixes(viper.GetStringSlice("trustedProxies"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid trustedProxies")
+	}
+	log.Info().Int("trustedProxies", len(trustedProxies)).Msg("reverse proxy configuration loaded")
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	// Must run before anything that looks at RemoteAddr (request log, rate limits).
+	r.Use(realip.Middleware(trustedProxies))
 	r.Use(securityHeaders)
 	r.Use(requestlog.Zerologger)
 	r.Get("/", func(rw http.ResponseWriter, r *http.Request) {
