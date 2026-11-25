@@ -121,6 +121,10 @@ func main() {
 		// (each /auth → /callback round-trip uses two requests) but cuts off
 		// brute-force enumeration of nonces or session IDs.
 		auth.WithAuthRateLimiter(httprate.LimitByIP(30, time.Minute)),
+		// Each wrong client secret costs a bcrypt comparison; stop an address
+		// after 10 failures a minute so it can't burn CPU. Successful client
+		// authentications are never counted.
+		auth.WithClientAuthFailureLimit(10, time.Minute),
 	}
 	if dbPath := viper.GetString("oidc.sessionDB"); dbPath != "" {
 		oidcOpts = append(oidcOpts, auth.WithSessionDB(dbPath))

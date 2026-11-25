@@ -45,6 +45,7 @@ type OIDCProvider struct {
 	jwksJSON      []byte
 
 	authRateLimit func(http.Handler) http.Handler
+	clientAuth    *clientAuthGuard
 
 	janitorStop chan struct{}
 	janitorDone chan struct{}
@@ -90,6 +91,9 @@ type oidcOptions struct {
 	authRateLimit func(http.Handler) http.Handler
 	sessionDB     string
 	webhookSecret []byte
+
+	clientAuthMaxFailures int
+	clientAuthWindow      time.Duration
 }
 
 type funcOIDCOption struct {
@@ -159,6 +163,9 @@ func NewOIDC(path string, disc discourse.SSOConfig, clients map[string]fosite.Cl
 		discourseSecret: disc.Secret,
 		authRateLimit:   oopts.authRateLimit,
 	}
+	if oopts.clientAuthMaxFailures > 0 {
+		provider.clientAuth = newClientAuthGuard(oopts.clientAuthMaxFailures, oopts.clientAuthWindow)
+	}
 	if err := provider.precomputeDiscovery(); err != nil {
 		_ = loginStore.Close()
 		return nil, fmt.Errorf("precomputing discovery document: %w", err)
@@ -199,6 +206,19 @@ func WithAuthRateLimiter(mw func(http.Handler) http.Handler) OIDCOption {
 	return &funcOIDCOption{
 		func(o *oidcOptions) {
 			o.authRateLimit = mw
+		},
+	}
+}
+
+// WithClientAuthFailureLimit caps failed client authentications per client
+// address on /token, /introspect and /revoke: once an address has failed
+// maxFailures times within window, those endpoints answer 429 without
+// checking the secret. Successful requests are not counted. If unset, there is no cap.
+func WithClientAuthFailureLimit(maxFailures int, window time.Duration) OIDCOption {
+	return &funcOIDCOption{
+		func(o *oidcOptions) {
+			o.clientAuthMaxFailures = maxFailures
+			o.clientAuthWindow = window
 		},
 	}
 }
@@ -247,13 +267,13 @@ func (o *OIDCProvider) RegisterHandlers(r chi.Router) {
 	}
 	authR.Get("/auth", o.authEndpoint)
 	authR.Get("/callback", o.callbackEndpoint)
-	r.Post("/token", limitBody(o.tokenEndpoint))
-	r.Post("/introspect", limitBody(o.introspectionEndpoint))
+	r.Post("/token", limitBody(o.clientAuth.wrap(o.tokenEndpoint)))
+	r.Post("/introspect", limitBody(o.clientAuth.wrap(o.introspectionEndpoint)))
 	r.MethodFunc(http.MethodGet, "/userinfo", o.userInfoEndpoint)
 	r.MethodFunc(http.MethodPost, "/userinfo", limitBody(o.userInfoEndpoint))
 
 	// revoke tokens
-	r.Post("/revoke", limitBody(o.revokeEndpoint))
+	r.Post("/revoke", limitBody(o.clientAuth.wrap(o.revokeEndpoint)))
 
 	r.Get("/.well-known/openid-configuration", o.informationEndpoint)
 	r.Get("/certs", o.certsEndpoint)
