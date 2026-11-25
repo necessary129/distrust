@@ -481,3 +481,65 @@ func TestDiscoveryEndpointAdvertisesEndpointsAndCapabilities(t *testing.T) {
 		}
 	}
 }
+
+// startLogin runs /auth for the integration client and returns the
+// oidc_session cookie plus the nonce distrust sent to Discourse.
+func startLogin(t *testing.T, provider *OIDCProvider, router http.Handler) (*http.Cookie, string) {
+	t.Helper()
+	authURL := "/oauth2/auth?client_id=test-client&response_type=code&scope=openid&state=state-123456789&redirect_uri=https%3A%2F%2Fclient.example%2Fcallback"
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, httptest.NewRequest(http.MethodGet, authURL, nil))
+	for _, c := range res.Result().Cookies() {
+		if c.Name == "oidc_session" {
+			id, err := uuid.Parse(c.Value)
+			if err != nil {
+				t.Fatalf("invalid session cookie: %v", err)
+			}
+			provider.inflightMu.Lock()
+			defer provider.inflightMu.Unlock()
+			return c, provider.inflight[id].Nonce
+		}
+	}
+	t.Fatalf("no oidc_session cookie from /auth (status %d)", res.Code)
+	return nil, ""
+}
+
+func callback(router http.Handler, cookie *http.Cookie, sso, sig string) *url.URL {
+	q := url.Values{"sso": {sso}, "sig": {sig}}
+	req := httptest.NewRequest(http.MethodGet, "/oauth2/callback?"+q.Encode(), nil)
+	req.AddCookie(cookie)
+	res := httptest.NewRecorder()
+	router.ServeHTTP(res, req)
+	loc, _ := url.Parse(res.Header().Get("Location"))
+	return loc
+}
+
+func TestCallbackAcceptsLongGroupList(t *testing.T) {
+	provider, router := newIntegrationProviderAndRouter(t)
+	cookie, nonce := startLogin(t, provider, router)
+
+	groups := strings.TrimSuffix(strings.Repeat("some-group-name,", 24), ",") // 383 bytes
+	payload := "nonce=" + url.QueryEscape(nonce) + "&external_id=1&username=alice&groups=" + url.QueryEscape(groups)
+	sso, sig := signDiscourseSSO(t, "disc-secret", payload)
+
+	loc := callback(router, cookie, sso, sig)
+	if loc.Query().Get("code") == "" {
+		t.Fatalf("expected an authorization code, got redirect %q", loc)
+	}
+}
+
+func TestCallbackReportsStandardErrorCode(t *testing.T) {
+	provider, router := newIntegrationProviderAndRouter(t)
+	cookie, nonce := startLogin(t, provider, router)
+
+	sso, _ := signDiscourseSSO(t, "disc-secret", "nonce="+url.QueryEscape(nonce)+"&external_id=1&username=alice")
+	_, badSig := signDiscourseSSO(t, "wrong-secret", "nonce="+url.QueryEscape(nonce)+"&external_id=1&username=alice")
+
+	loc := callback(router, cookie, sso, badSig)
+	if got := loc.Query().Get("error"); got != "server_error" {
+		t.Fatalf("error code: got %q want server_error (redirect %q)", got, loc)
+	}
+	if loc.Query().Get("state") != "state-123456789" {
+		t.Fatalf("state not echoed: %q", loc)
+	}
+}

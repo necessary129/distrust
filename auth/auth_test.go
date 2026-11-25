@@ -113,6 +113,18 @@ func TestValidateDiscoursePayload(t *testing.T) {
 		t.Fatal("expected oversized name to be rejected")
 	}
 
+	manyGroups := good()
+	manyGroups["groups"] = []string{strings.Repeat("group-name,", 30)} // 330 bytes
+	if err := validateDiscoursePayload(manyGroups); err != nil {
+		t.Fatalf("long group list rejected: %v", err)
+	}
+
+	tooManyGroups := good()
+	tooManyGroups["groups"] = []string{strings.Repeat("g", maxGroupsFieldBytes+1)}
+	if err := validateDiscoursePayload(tooManyGroups); err == nil {
+		t.Fatal("expected group list over maxGroupsFieldBytes to be rejected")
+	}
+
 	badEmail := good()
 	badEmail["email"] = []string{"not-an-email"}
 	if err := validateDiscoursePayload(badEmail); err == nil {

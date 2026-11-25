@@ -100,15 +100,19 @@ func (o *OIDCProvider) callbackEndpoint(rw http.ResponseWriter, req *http.Reques
 		return
 	}
 
+	// Plain errors would reach the RP as the non-standard `error=error`;
+	// report them as server_error. The detail stays in the server log
+	// (fosite only sends debug text to clients when explicitly enabled).
 	values, err := discourse.ValidateResponse(req.URL.Query().Get("sso"), req.URL.Query().Get("sig"), o.discourseSecret, session.Nonce)
 	if err != nil {
-		o.oauth2.WriteAuthorizeError(ctx, rw, session.Ar, err)
+		log.Warn().Err(err).Msg("rejecting discourse response")
+		o.oauth2.WriteAuthorizeError(ctx, rw, session.Ar, fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 		return
 	}
 
 	if err := validateDiscoursePayload(values); err != nil {
 		log.Warn().Err(err).Msg("rejecting discourse payload")
-		o.oauth2.WriteAuthorizeError(ctx, rw, session.Ar, err)
+		o.oauth2.WriteAuthorizeError(ctx, rw, session.Ar, fosite.ErrServerError.WithWrap(err).WithDebug(err.Error()))
 		return
 	}
 
@@ -354,6 +358,12 @@ func (o *OIDCProvider) userInfoEndpoint(rw http.ResponseWriter, req *http.Reques
 // not shape; this caps the blast radius of a hostile or buggy upstream.
 const maxClaimFieldBytes = 256
 
+// maxGroupsFieldBytes bounds the comma-separated group list separately.
+// Discourse sends every group the user belongs to, so members of many groups
+// (admins especially) easily pass maxClaimFieldBytes. The whole SSO payload
+// is already capped by the discourse package at 8 KiB of base64.
+const maxGroupsFieldBytes = 4096
+
 // validateDiscoursePayload enforces basic shape constraints on the post-HMAC
 // SSO payload before its fields are copied into ID-token claims (M8).
 func validateDiscoursePayload(v url.Values) error {
@@ -366,11 +376,14 @@ func validateDiscoursePayload(v url.Values) error {
 	if _, err := strconv.ParseInt(v.Get("external_id"), 10, 64); err != nil {
 		return fmt.Errorf("discourse external_id is not numeric: %w", err)
 	}
-	bounded := []string{"external_id", "username", "name", "email", "avatar_url", "groups"}
+	bounded := []string{"external_id", "username", "name", "email", "avatar_url"}
 	for _, k := range bounded {
 		if len(v.Get(k)) > maxClaimFieldBytes {
 			return fmt.Errorf("discourse payload field %q exceeds %d bytes", k, maxClaimFieldBytes)
 		}
+	}
+	if len(v.Get("groups")) > maxGroupsFieldBytes {
+		return fmt.Errorf("discourse payload field %q exceeds %d bytes", "groups", maxGroupsFieldBytes)
 	}
 	if email := v.Get("email"); email != "" {
 		if _, err := mail.ParseAddress(email); err != nil {

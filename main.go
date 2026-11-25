@@ -21,6 +21,7 @@ import (
 	"github.com/ory/fosite"
 	"github.com/parkour-vienna/distrust/auth"
 	"github.com/parkour-vienna/distrust/discourse"
+	"github.com/parkour-vienna/distrust/realip"
 	"github.com/parkour-vienna/distrust/requestlog"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -74,8 +75,16 @@ func main() {
 		Secret: viper.GetString("discourse.secret"),
 	}
 
+	trustedProxies, err := realip.ParsePrefixes(viper.GetStringSlice("trustedProxies"))
+	if err != nil {
+		log.Fatal().Err(err).Msg("invalid trustedProxies")
+	}
+	log.Info().Int("trustedProxies", len(trustedProxies)).Msg("reverse proxy configuration loaded")
+
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
+	// Must run before anything that looks at RemoteAddr (request log, rate limits).
+	r.Use(realip.Middleware(trustedProxies))
 	r.Use(securityHeaders)
 	r.Use(requestlog.Zerologger)
 	r.Get("/", func(rw http.ResponseWriter, r *http.Request) {
@@ -121,6 +130,10 @@ func main() {
 		// (each /auth → /callback round-trip uses two requests) but cuts off
 		// brute-force enumeration of nonces or session IDs.
 		auth.WithAuthRateLimiter(httprate.LimitByIP(30, time.Minute)),
+		// Each wrong client secret costs a bcrypt comparison; stop an address
+		// after 10 failures a minute so it can't burn CPU. Successful client
+		// authentications are never counted.
+		auth.WithClientAuthFailureLimit(10, time.Minute),
 	}
 	if dbPath := viper.GetString("oidc.sessionDB"); dbPath != "" {
 		oidcOpts = append(oidcOpts, auth.WithSessionDB(dbPath))
